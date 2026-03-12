@@ -1,0 +1,16 @@
+[system]
+
+[system.logger]
+level = "DEBUG"
+buffersize = 5
+ # int (bytes) or str with suffix ("1b" , "1kb" , "1mb")
+max_file_size = "64kb"
+log_to_console = true
+log_to_file = true
+max_rotations = 3
+
+[comms]
+
+[comms.mesh]
+enabled = true
+#secret = "Ur shared secret key"

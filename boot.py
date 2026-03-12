@@ -1,0 +1,2 @@
+import core
+core.init()
