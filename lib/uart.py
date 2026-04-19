@@ -6,7 +6,7 @@ import utime
 
 from core.logging import logger
 
-# ── Protocol constants (must match host side) ──────────────────────────────────
+# Protocol constants
 COMMAND_PREFIX     = "cmd:"
 COMMAND_DELIMITER  = ";"
 COMMAND_TERMINATOR = ":end"
@@ -17,8 +17,8 @@ CMD_SENSORS      = "SNS"
 CMD_LOG_INFO     = "LGI"
 CMD_LOG_DOWNLOAD = "LGD"
 
-# ── Pin config ─────────────────────────────────────────────────────────────────
-UART_ID   = 2        # UART2 on ESP32
+# Pin config
+UART_ID   = 1        # UART2 on ESP32
 UART_TX   = 17       # GP17 → peer RX
 UART_RX   = 16       # GP16 ← peer TX
 BAUD_RATE = 115200
@@ -77,10 +77,6 @@ def get_log_entries(log_id: int) -> list:
     ]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# UART driver
-# ══════════════════════════════════════════════════════════════════════════════
-
 class ESPUartResponder:
     """
     Listens on UART2 (GP16/GP17) for command frames from the WIFI-MCU,
@@ -91,17 +87,30 @@ class ESPUartResponder:
     """
 
     def __init__(self):
-        self.uart = UART(
+        import gc
+
+        gc.collect()
+        print("FREE:", gc.mem_free())
+
+        # Deinit first — soft reboot leaves ESP-IDF UART driver installed
+        _cleanup = UART(UART_ID, tx=Pin(UART_TX), rx=Pin(UART_RX))
+        _cleanup.deinit()
+
+        self._uart = UART(
             UART_ID,
             baudrate=BAUD_RATE,
+            bits=8,
+            parity=None,
+            stop=1,
+            timeout=100,
             tx=Pin(UART_TX),
             rx=Pin(UART_RX),
+            rxbuf=256,
         )
         self.led = Pin(STATUS_LED_PIN, Pin.OUT)
 
-    # ── Frame codec ────────────────────────────────────────────────────────────
-
-    def _encode(self, command: str, parameters: dict) -> bytes:
+    @staticmethod
+    def _encode(command: str, parameters: dict) -> bytes:
         return (
             COMMAND_PREFIX
             + command
@@ -111,7 +120,8 @@ class ESPUartResponder:
             + "\n"
         ).encode()
 
-    def _decode(self, raw: str) -> tuple[str, dict]:
+    @staticmethod
+    def _decode(raw: str) -> tuple[str, dict]:
         """
         Parse a raw frame into (command_token, parameters_dict).
         Raises ValueError for malformed frames.
@@ -127,15 +137,13 @@ class ESPUartResponder:
         params  = ujson.loads(parts[1]) if len(parts) == 2 and parts[1] else {}
         return command, params
 
-    # ── Low-level I/O ──────────────────────────────────────────────────────────
-
     def _write(self, command: str, parameters: dict):
-        self.uart.write(self._encode(command, parameters))
+        self._uart.write(self._encode(command, parameters))
 
     async def _read_line(self) -> str | None:
         """Return the next complete line or None if nothing is available yet."""
-        if self.uart.any():
-            raw = self.uart.readline()
+        if self._uart.any():
+            raw = self._uart.readline()
             if raw:
                 return raw.decode().strip()
 
@@ -146,8 +154,6 @@ class ESPUartResponder:
         self.led.on()
         await asyncio.sleep_ms(30)
         self.led.off()
-
-    # ── Command handlers ───────────────────────────────────────────────────────
 
     def _handle_ping(self, _params: dict):
         self._write(CMD_PING, {"status": "ok"})
@@ -169,8 +175,6 @@ class ESPUartResponder:
         # Empty terminator frame signals end-of-stream to the host
         self._write(CMD_LOG_DOWNLOAD, {})
 
-    # ── Dispatch table ─────────────────────────────────────────────────────────
-
     _HANDLERS = {
         CMD_PING:         _handle_ping,
         CMD_STATUS:       _handle_status,
@@ -186,8 +190,6 @@ class ESPUartResponder:
         else:
             logger().warn(f"UART Unknown command: {command!r}")
             self._write(command, {"error": "unknown_command"})
-
-    # ── Main async loop ────────────────────────────────────────────────────────
 
     async def run(self):
         logger().debug("UART Responder started – listening on GP16/GP17")
@@ -208,21 +210,7 @@ class ESPUartResponder:
             except ValueError as e:
                 logger().error(f"UART Frame error: {e}")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Entry point
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def main():
     responder = ESPUartResponder()
 
-    # TODO: add your other top-level coroutines here, e.g.:
-    #   asyncio.create_task(espnow_mesh.run())
-    #   asyncio.create_task(sensor_poller.run())
-    #   asyncio.create_task(sleep_scheduler.run())
-
     await responder.run()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

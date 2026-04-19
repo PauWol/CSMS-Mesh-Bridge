@@ -5,39 +5,34 @@ This module provides utility functions for the PicoCore V2 Comms Mesh module.
 """
 
 import ustruct as struct
-from ..constants import BASE_HEADER_FORMAT_NO_CRC, BASE_HEADER_SIZE_NO_CRC, MESH_VERSION, MAX_PAYLOAD_SIZE, \
-    MESH_FLAG_PARTIAL_START, MESH_FLAG_PARTIAL_END, MESH_FLAG_PARTIAL
-from ..crc8 import append_crc8_to_bytearray, verify_crc8
+import ujson
+from core.comms.constants import BASE_HEADER_FORMAT_NO_CRC, BASE_HEADER_SIZE_NO_CRC, MESH_VERSION, MAX_PAYLOAD_SIZE, \
+    MESH_FLAG_PARTIAL_START, MESH_FLAG_PARTIAL_END, MESH_FLAG_PARTIAL, MESH_FLAG_GATEWAY
+from core.comms.crc8 import append_crc8_to_bytearray, verify_crc8
 
 
-def payload_conv(payload: str | bytes | bytearray, _iter: bool = False):
+def payload_conv(payload: str | bytes | bytearray):
     """
     Convert payload to bytes.
     :param payload:
-    :param _iter: If True, return a generator for large payloads (>MAX_PAYLOAD_SIZE=239)
     :return: bytes or generator
     """
-    _p = b""
-    if isinstance(payload, str):
-        _p = payload.encode()
-    if isinstance(payload, bytearray):
-        _p = payload
-    else:
-        _p = payload
+    return payload.encode() if isinstance(payload, str) else payload
 
-    if len(_p) > MAX_PAYLOAD_SIZE and not _iter:
-        raise ValueError("Payload too large")
+def payload_conv_iter(payload: str | bytes | bytearray):
+    """
+    Convert payload to bytes.
+    :param payload:
+    :return: bytes or generator
+    """
+    _p = payload.encode() if isinstance(payload, str) else payload
 
-    if _iter:
-        for i in range(0, len(_p), MAX_PAYLOAD_SIZE):
-            yield _p[i:i + MAX_PAYLOAD_SIZE]
-
-    return _p
-
+    for i in range(0, len(_p), MAX_PAYLOAD_SIZE):
+        yield _p[i:i + MAX_PAYLOAD_SIZE]
 
 def build_packet(ptype: int, src: int, dst: int, seq: int,
                  # pylint: disable=too-many-arguments,too-many-positional-arguments
-                 ttl: int, flags: int, payload: bytes) -> bytearray:
+                 ttl: int, flags: int, payload: bytes,gateway:bool = False) -> bytearray:
     """
     Build a mesh packet.
     :param ptype: Payload Type
@@ -47,6 +42,7 @@ def build_packet(ptype: int, src: int, dst: int, seq: int,
     :param ttl: Time To Live (hops)
     :param flags: Flags byte
     :param payload: Payload as bytes (0-255 bytes)
+    :param gateway: If true the packet automatically adds MESH_FLAG_GATEWAY
     :return: Packet as bytearray [header+CRC8+payload]
     """
     version = MESH_VERSION
@@ -61,11 +57,18 @@ def build_packet(ptype: int, src: int, dst: int, seq: int,
     assert 0 <= flags <= 255
     assert _plen <= 255
 
-    # Pack header without CRC
-    header = bytearray(struct.pack(BASE_HEADER_FORMAT_NO_CRC,
-                                   version, ptype, src, dst, seq,
-                                   ttl, flags, _plen))
-    # Append CRC8 of header
+    if gateway:
+        # Pack header without CRC
+        header = bytearray(struct.pack(BASE_HEADER_FORMAT_NO_CRC,
+                                       version, ptype, src, dst, seq,
+                                       ttl, flags | MESH_FLAG_GATEWAY, _plen))
+    else:
+        # Pack header without CRC
+        header = bytearray(struct.pack(BASE_HEADER_FORMAT_NO_CRC,
+                                       version, ptype, src, dst, seq,
+                                       ttl, flags, _plen))
+
+        # Append CRC8 of header
     append_crc8_to_bytearray(header)
     # Return final packet
     return header + payload
@@ -122,68 +125,47 @@ def chunk_packet(ptype: int, src: int, dst: int, seq: int,
     :param _payload:
     :yields: the build packets
     """
+    print("chunking...")
+    _plen = len(_payload)
 
-    if _payload < MAX_PAYLOAD_SIZE:
+    if _plen <= MAX_PAYLOAD_SIZE:
+        print("One Packet")
         yield build_packet(ptype, src, dst, seq, ttl, flags, payload_conv(_payload))
+        return
 
-    _chunk_count = len(_payload) / MAX_PAYLOAD_SIZE
+    _chunk_count = (_plen + MAX_PAYLOAD_SIZE - 1) // MAX_PAYLOAD_SIZE
+    print(f"chunk count: {_chunk_count}")
 
-    for i, v in enumerate(payload_conv(_payload, True)):
+    for i, v in enumerate(payload_conv_iter(_payload)):
 
         if i == 0:
+            print("start packet")
             yield build_packet(ptype, src, dst, seq, ttl, flags | MESH_FLAG_PARTIAL_START, v)
 
-        if i == _chunk_count:
+        elif i == _chunk_count - 1:
+            print("end packet")
             yield build_packet(ptype, src, dst, seq, ttl, flags | MESH_FLAG_PARTIAL_END, v)
 
         else:
-
+            print("partial packet")
             yield build_packet(ptype, src, dst, seq, ttl, flags | MESH_FLAG_PARTIAL, v)
 
 
-def encode_neighbour_tuple(data: tuple[int, bytes, int, int, int, int, bool]) -> bytes:
-    """
-    Encode tuple (int, bytes, int, int, int, int, bool) to bytes.
-    Format:
-    - int (4 bytes)
-    - length of bytes field (4 bytes)
-    - bytes field (variable length)
-    - int (4 bytes)
-    - int (4 bytes)
-    - int (4 bytes)
-    - int (4 bytes)
-    - bool (1 byte)
+def encode_neighbour_tuple(_neighbors: dict) -> bytes:
+    safe = []
+    for entry in _neighbors.values():
+        node_id = entry[0]
+        mac = entry[1]
+        rest = entry[2:]
+        safe.append((node_id, mac.hex()) + tuple(rest))
+    return ujson.dumps(safe).encode()
 
-    :param data: The neighbor as tuple(node_id, mac, version, seq, now, rssi, gateway)
-    :return: bytes
-    """
-    a, b_bytes, c, d, e, f, g = data
-    b_len = len(b_bytes)
-
-    # Pack fixed parts + length of bytes field
-    header = struct.pack('ii', a, b_len)
-    # Pack remaining ints and bool
-    tail = struct.pack('iiii?', c, d, e, f, g)
-
-    return header + b_bytes + tail
-
-
-def decode_neighbour_bytes(encoded: bytes) -> tuple[int, bytes, int, int, int, int, bool]:
-    """
-    Decode bytes neighbour object back to tuple.
-
-    :param encoded: The neighbor as encoded bytes tuple(node_id, mac, version, seq, now, rssi, gateway)
-    :return: tuple(node_id, mac, version, seq, now, rssi, gateway)
-    """
-    # Unpack first two ints: a and length of bytes field
-    a, b_len = struct.unpack('ii', encoded[:8])
-
-    # Extract bytes field
-    b_start = 8
-    b_end = b_start + b_len
-    b_bytes = encoded[b_start:b_end]
-
-    # Unpack remaining ints and bool
-    c, d, e, f, g = struct.unpack('iiii?', encoded[b_end:b_end + 17])
-
-    return a, b_bytes, c, d, e, f, g
+def decode_neighbour_bytes(encoded: bytes) -> list:
+    raw = ujson.loads(encoded.decode())
+    fixed = []
+    for entry in raw:
+        node_id = entry[0]
+        mac_hex = entry[1]
+        rest = entry[2:]
+        fixed.append((node_id, bytes.fromhex(mac_hex)) + tuple(rest))
+    return fixed

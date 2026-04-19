@@ -42,6 +42,7 @@ async def _delayed_clear_boot_flag():
     await asyncio.sleep_ms(BOOT_WINDOW_MS)
     _remove_boot_flag()
 
+#TODO: replace this with other more efficient logic. May use a hardware pin to  set it
 async def boot_flag_task():
     """
     This function checks if the boot flag file exists and if it does,
@@ -148,7 +149,7 @@ def version() -> list[str]|None:
     _v_path = "/core/.version"
     try:
         if os.stat(_v_path)[6] >= 13:
-            with open(_v_path, "r",encoding="utf-8") as version_file:
+            with open(_v_path,encoding="utf-8") as version_file:
                 return version_file.read().strip().replace("\r", "").split("\n")
         else:
             raise ValueError("Version file could not be read."
@@ -187,3 +188,22 @@ def get_onboard_led() -> int | str:
     raise RuntimeError("Unsupported platform: " + platform)
 
 ONBOARD_LED: str | int | None = get_onboard_led()
+
+def timed_function(f, *args, **kwargs):
+    """
+    A decorator function to test the execution time of any function decorated with @timed_function.
+
+    :param f:
+    :param args:
+    :param kwargs:
+
+    :returns:
+    """
+    myname = f.__name__
+    def new_func(*args, **kwargs):
+        t = time.ticks_us()
+        result = f(*args, **kwargs)
+        delta = time.ticks_diff(time.ticks_us(), t)
+        print('Function {} Time = {:6.3f}ms'.format(myname, delta/1000))
+        return result
+    return new_func

@@ -1,15 +1,41 @@
 """
 PicoCore V2 Constants
 
-This file contains all centralized constants used in the PicoCore V2.
+This file contains all centralized constants used by PicoCore V2.
 """
 
 from micropython import const
 import ustruct
 
+# --------------------- Old config ---------------------
+# TODO: Needs to be revised
+# Power modes
+PM_ACTIVE = const("ACTIVE")
+PM_IDLE = const("IDLE")
+PM_ECO = const("ECO")
+PM_LIGHT_SLEEP = const("LIGHT_SLEEP")
+PM_DEEP_SLEEP = const("DEEP_SLEEP")
+PM_OFF = const("OFF")
+
+PM_LIST = [PM_ECO,PM_ACTIVE,PM_OFF,PM_IDLE,PM_LIGHT_SLEEP,PM_DEEP_SLEEP]
+
+
+NORMALIZED_VOLTAGE_DIFFERENCE_V_MAX_TO_V_NOMINAL = 0.1
+NORMALIZED_VOLTAGE_MARGIN_V_CUT_OFF_TO_V_NOMINAL = 0.2
 
 
 # --------------------- Configuration ---------------------
+
+POWER_MONITOR_ENABLED = const("power.monitoring.enabled")
+POWER_BATTERY_VOLTAGE_MAX = const("power.battery.battery_voltage_max")
+POWER_BATTERY_VOLTAGE_NOMINAL = const("power.battery.battery_voltage_nominal")
+POWER_BATTERY_AH = const("power.battery.battery_ah")
+POWER_BATTERY_VOLTAGE_CUT_OFF = const("power.battery.battery_voltage_cut_off")
+POWER_ADC_PIN = const("power.battery.adc_pin")
+
+POWER_VOLTAGE_DIVIDER_ENABLED = const("power.voltage_divider.enabled")
+POWER_VOLTAGE_DIVIDER_R1 = const("power.voltage_divider.r1")
+POWER_VOLTAGE_DIVIDER_R2 = const("power.voltage_divider.r2")
 
 LOGGER_LEVEL = const("system.logger.level")
 LOGGER_BUFFER_SIZE = const("system.logger.buffersize")
@@ -20,6 +46,26 @@ LOGGER_MAX_ROTATIONS = const("system.logger.max_rotations")
 
 MESH_ENABLED = const("comms.mesh.enabled")
 MESH_SECRET = const("comms.mesh.secret")
+MESH_GATEWAY = const("comms.mesh.gateway")
+
+
+SLEEP_INTERVAL = const("system.runtime.interval")
+# root rules
+
+
+
+
+# --------------------- Event Bus ---------------------
+
+BUS_SYSTEM_ROOT_PATH = const("system/root")
+BUS_SYSTEM_POWER_PATH = const("system/root/power")
+
+
+EVENT_ROOT_LOOP_TICK = const("root/loop/tick")
+
+EVENT_ROOT_LOOP_BOOT_BEFORE = const("root/loop/boot/before")
+EVENT_ROOT_LOOP_BOOT_AFTER = const("root/loop/boot/after")
+EVENT_ROOT_LOOP_BOOT = const("root/loop/boot")
 
 
 # --------------------- Boot ---------------------

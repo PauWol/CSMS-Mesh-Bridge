@@ -18,25 +18,51 @@ Usage:
 
     start()
 """
-import time
+
+import asyncio
 from machine import Pin
-from . import io
 from . import config
+from .root import root, start, task, on, bus, emit, manual, off, stop, add_task
+from . import io
 from . import logging
 from . import constants
-from .util import (version , uuid , uptime , _file_exists , BOOT_FLAG ,
-                   _remove_boot_flag , _create_boot_flag,ONBOARD_LED)
-from .comms import crc8
+from .util import (
+    version,
+    uuid,
+    uptime,
+    _file_exists,
+    BOOT_FLAG,
+    _remove_boot_flag,
+    _create_boot_flag,
+    ONBOARD_LED,
+    timed_function,
+)
 
-__all__ = ['version', 'uuid','init','uptime','logging',
-           'constants','config','ONBOARD_LED'
-        ]
-
-
-
+__all__ = [
+    "version",
+    "uuid",
+    "root",
+    "init",
+    "uptime",
+    "io",
+    "logging",
+    "constants",
+    "config",
+    "task",
+    "on",
+    "bus",
+    "emit",
+    "manual",
+    "off",
+    "start",
+    "ONBOARD_LED",
+    "timed_function",
+    "add_task",
+]
 
 
 # call this from boot.py (early) or from Root.boot() before starting scheduler
+@timed_function
 def check_double_boot_and_maybe_enter_safe_mode():
     """
     Usage:
@@ -49,10 +75,14 @@ def check_double_boot_and_maybe_enter_safe_mode():
         # remove flag so future boots are normal
         _remove_boot_flag()
         # Enter safe mode now
+        stop()
         return True
 
     # otherwise create the flag and schedule a deferred removal
-    _create_boot_flag()
+    @task(None, async_task=True, boot=True, parallel=True)
+    async def create_boot_flag_task():
+        _create_boot_flag()
+        await asyncio.sleep(0)
 
     # schedule deletion after BOOT_WINDOW_MS inside event loop.
     # We cannot create uasyncio tasks safely from here if event loop not running.
@@ -62,28 +92,46 @@ def check_double_boot_and_maybe_enter_safe_mode():
     return False
 
 
+@timed_function
+def init_con():
+    config.get_config("config.toml")
+
+
+@timed_function
+def init_log():
+    logging.init_logger()
+
+
+@timed_function
+def led_init():
+    return io.Led(ONBOARD_LED, Pin.OUT)
+
+
+@timed_function
 def init():
     """
     Initialize PicoCore.All boot time configuration is executed here.
     Needs to be called at the very start of the boot.py file to use benefits of PicoCore.
     :return:
     """
+    import sys
+
+    sys.path.insert(0, "/")
     # Get/Initiate config
-    config.get_config("config.toml")
+    init_con()
+
     # Initiate logging
-    logging.init_logger()
+    init_log()
     # Initiate root
+    root()
     safe_boot = check_double_boot_and_maybe_enter_safe_mode()
 
-    led = io.Led(ONBOARD_LED, Pin.OUT)
+    led = led_init()
 
-    for _ in range(3):
-        led.toggle()
-        time.sleep(0.2)
-        led.toggle()
-        time.sleep(0.2)
-
-    led.off()
+    # schedule root loop boot blink
+    @task(None, async_task=True, boot=True, parallel=True)
+    async def boot_led():
+        await led.async_blink(6, 0.2)
 
     if safe_boot:
         led.on()
