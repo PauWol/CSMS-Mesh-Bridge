@@ -1,30 +1,25 @@
-from uasyncio import run, gather
+import asyncio
 
-from core.logging import logger
 from core.comms.mesh import mesh, mesh_callback
+from core import start,task
 
 from lib.uart import ESPUartResponder
 from lib.data import data
 
-@mesh_callback()
-async def _callback(host,msg):
-    print(host,msg)
-    data().receive(msg)
-
-
-mesh().start()
-
-async def main():
+@task(0,boot=True,parallel=True)
+async def init():
+    mesh().rx_enable()
+    print(mesh().stats())
 
     uart_res = ESPUartResponder()
-
-    tasks = gather(
-        mesh().run(),
-        uart_res.run()
-    )
-    logger().debug("tasks gathered")
-    await tasks
+    await uart_res.run()
 
 
-if __name__ == '__main__':
-    run(main())
+@mesh_callback
+async def cbl(host, msg):
+    print(f"{host}: {msg}")
+    data().receive(msg)
+    await asyncio.sleep(0)
+
+
+start()

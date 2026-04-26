@@ -6,10 +6,14 @@ import utime
 
 from core.logging import logger
 
+from comms_commands import ping
+
 # Protocol constants
 COMMAND_PREFIX     = "cmd:"
 COMMAND_DELIMITER  = ";"
 COMMAND_TERMINATOR = ":end"
+
+CMD_UART_ACK = "UAK"
 
 CMD_PING         = "PNG"
 CMD_STATUS       = "STS"
@@ -83,18 +87,17 @@ class ESPUartResponder:
     dispatches each command to the matching handler, and writes the response
     back on the same UART.
 
-    Status LED (GP18) blinks once for every command that is received.
+    Status LED blinks once for every command that is received.
     """
 
     def __init__(self):
         import gc
 
         gc.collect()
-        print("FREE:", gc.mem_free())
+        print("FREE before UART:", gc.mem_free())
 
-        # Deinit first — soft reboot leaves ESP-IDF UART driver installed
-        _cleanup = UART(UART_ID, tx=Pin(UART_TX), rx=Pin(UART_RX))
-        _cleanup.deinit()
+        tx_pin = Pin(UART_TX)
+        rx_pin = Pin(UART_RX)
 
         self._uart = UART(
             UART_ID,
@@ -103,9 +106,9 @@ class ESPUartResponder:
             parity=None,
             stop=1,
             timeout=100,
-            tx=Pin(UART_TX),
-            rx=Pin(UART_RX),
-            rxbuf=256,
+            tx=tx_pin,
+            rx=rx_pin,
+            rxbuf=512,
         )
         self.led = Pin(STATUS_LED_PIN, Pin.OUT)
 
@@ -155,41 +158,55 @@ class ESPUartResponder:
         await asyncio.sleep_ms(30)
         self.led.off()
 
-    def _handle_ping(self, _params: dict):
-        self._write(CMD_PING, {"status": "ok"})
+    async def _handle_uart_ack(self, _params: dict):
+        self._write(CMD_UART_ACK, {"status": "ok"})
+        await asyncio.sleep_ms(0)
 
-    def _handle_status(self, _params: dict):
+    async def _handle_ping(self, _params: dict):
+        st = "ok"
+
+        if not await ping():
+            st = "unconnected"
+        self._write(CMD_PING, {"status": st})
+
+    async def _handle_status(self, _params: dict):
         self._write(CMD_STATUS, get_status())
+        await asyncio.sleep_ms(0)
 
-    def _handle_sensors(self, _params: dict):
+    async def _handle_sensors(self, _params: dict):
         self._write(CMD_SENSORS, get_sensors())
+        await asyncio.sleep_ms(0)
 
-    def _handle_log_info(self, _params: dict):
+    async def _handle_log_info(self, _params: dict):
         self._write(CMD_LOG_INFO, get_log_info())
+        await asyncio.sleep_ms(0)
 
-    def _handle_log_download(self, params: dict):
+    async def _handle_log_download(self, params: dict):
         log_id  = int(params.get("id", 0))
         entries = get_log_entries(log_id)
         for entry in entries:
             self._write(CMD_LOG_DOWNLOAD, entry)
         # Empty terminator frame signals end-of-stream to the host
         self._write(CMD_LOG_DOWNLOAD, {})
+        await asyncio.sleep_ms(0)
 
     _HANDLERS = {
-        CMD_PING:         _handle_ping,
-        CMD_STATUS:       _handle_status,
-        CMD_SENSORS:      _handle_sensors,
-        CMD_LOG_INFO:     _handle_log_info,
+        CMD_PING: _handle_ping,
+        CMD_STATUS: _handle_status,
+        CMD_SENSORS: _handle_sensors,
+        CMD_LOG_INFO: _handle_log_info,
         CMD_LOG_DOWNLOAD: _handle_log_download,
+        CMD_UART_ACK: _handle_uart_ack,
     }
 
-    def _dispatch(self, command: str, params: dict):
+    async def _dispatch(self, command: str, params: dict):
         handler = self._HANDLERS.get(command)
         if handler:
-            handler(self, params)
+            await handler(self,params)
         else:
             logger().warn(f"UART Unknown command: {command!r}")
             self._write(command, {"error": "unknown_command"})
+            await asyncio.sleep_ms(0)
 
     async def run(self):
         logger().debug("UART Responder started – listening on GP16/GP17")
@@ -205,7 +222,7 @@ class ESPUartResponder:
             try:
                 command, params = self._decode(line)
                 logger().debug(f"UART ← {command} params={params}")
-                self._dispatch(command, params)
+                await self._dispatch(command, params)
 
             except ValueError as e:
                 logger().error(f"UART Frame error: {e}")
