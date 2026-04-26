@@ -54,7 +54,8 @@ Edit `config.toml` to customize:
 ## Protocol
 
 ### UART Commands (gateway → bridge)
-- `CMD_PING` – Health check
+- `CMD_UART_ACK` - Uart connection check ("ping for gateway")
+- `CMD_PING` – Health check ("ping for security-node")
 - `CMD_STATUS` – Device status
 - `CMD_SENSORS` – Sensor readings
 - `CMD_LOG_*` – Logging operations
