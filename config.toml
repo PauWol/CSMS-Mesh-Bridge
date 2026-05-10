@@ -13,3 +13,5 @@ max_rotations = 3
 
 [comms.mesh]
 enabled = true
+gateway = true
+security_node_id = 35812

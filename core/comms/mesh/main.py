@@ -4,7 +4,9 @@ PicoCore V2 Comms Mesh Main
 This module provides the PicoCore V2 Comms Mesh main class.
 """
 
+import io
 import os
+import sys
 import time
 import gc
 from network import WLAN, STA_IF
@@ -41,8 +43,8 @@ from core.queue import RingBuffer
 from core.root.bus import async_emit
 from core.logging import logger
 from core.config import get_config
-from core.util import _file_exists
-from .packets import (
+from core.util import _file_exists, deprecated
+from core.comms.mesh.packets import (
     build_packet,
     parse_packet,
     chunk_packet,
@@ -204,7 +206,7 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
 
         if len(self._seen_queue) > self._seen_limit:
             old = self._seen_queue.get()
-            self._seen_packets.remove(old)
+            self._seen_packets.discard(old)
 
         return False
 
@@ -577,9 +579,11 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
 
         key = (_src, _seq)
 
-        # DROP duplicates if not partial
+        # DROP duplicates if not partial or hello
         is_stream = _flags & (MESH_FLAG_FILE | MESH_FLAG_PARTIAL)
-        if not is_stream and self._seen(*key):
+        is_hello = _ptype == MESH_TYPE_HELLO
+
+        if not is_stream and not is_hello and self._seen(*key):
             return
 
         if _flags & MESH_FLAG_GATEWAY:
@@ -592,6 +596,10 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
 
         if _ptype == MESH_TYPE_HELLO:
             logger().debug("HELLO packet received")
+
+            to_remove = [k for k in self._seen_packets if k[0] == _src]
+            for k in to_remove:
+                self._seen_packets.discard(k)
 
             if _flags & MESH_FLAG_ACK:
                 await self.async_hello_ack(host)
@@ -756,7 +764,7 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
                 _payload = full
 
             if _flags & MESH_FLAG_ACK:
-                await self.async_send_ack(_src,_seq)
+                await self.async_send_ack(_src, _seq)
 
             try:
                 # (mac,node_id),(_payload)
@@ -771,7 +779,25 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
                     "(e.g. 'await asyncio.sleep(0)') to avoid blocking the scheduler."
                 )
                 logger().error(f"Original Mesh receive error: {e}")
+            except UnicodeError as e:
+                logger().error(
+                    "Mesh UnicodeError: payload could not be decoded as UTF-8.\n"
+                    "This usually means the sender transmitted raw binary data (e.g. struct-packed bytes).\n"
+                    "Fix options:\n"
+                    "  1. Register the callback with raw=True to receive bytes without decoding:\n"
+                    "       @mesh_callback(raw=True)\n"
+                    "  2. Base64-encode the payload before sending:\n"
+                    "       import ubinascii\n"
+                    "       encoded = ubinascii.b2a_base64(raw_bytes).strip()\n"
+                    "     and decode it in the callback:\n"
+                    "       ubinascii.a2b_base64(msg)"
+                )
+                logger().error(f"Original Mesh receive error: {e}")
+
             except Exception as e:
+                buf = io.StringIO()
+                sys.print_exception(e, buf)
+                logger().error(buf.getvalue())
                 logger().error(f"Mesh receive error in callback: {e}")
 
     def _hello(self) -> tuple[bytearray, bytes]:
@@ -987,7 +1013,7 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
         self,
         dst_node_id: int,
         payload: str | bytearray | bytes,
-            ack: bool = False,
+        ack: bool = False,
         not_found_error: bool = False,
     ) -> tuple[int, int]:
         """
@@ -1274,27 +1300,83 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
         self._raw_recv_callback_data = raw
         self._on_recv = callback
 
-    async def receive_task(self):
+    async def receive_task(self) -> None:
         """
-        This is the reception task. (DEPRECATED)
-        :return:
+        This is the new version of the reception task it now only handles that.
+        Only receives if rx_enabled was called.
+
+        Returns:
+
         """
         if not self._started:
             self.start()
+
+        _airecv = self._esp.airecv
+        _sleep_ms = asyncio.sleep_ms
+
         while True:
-            if not self._rx_enabled:
-                # nothing expected → idle cheaply
-                await asyncio.sleep_ms(250)
-                continue
+            # Receive
+            if self._rx_enabled:
+                try:
+                    host, msg = await _airecv()
+                    if host and msg:
+                        await self._irq(host, msg)
+                except asyncio.TimeoutError:
+                    pass
+                except Exception as e:
+                    buf = io.StringIO()
+                    sys.print_exception(e, buf)
+                    logger().error(buf.getvalue())
+                    logger().error(f"mesh rx error: {e}")
 
-            try:
-                host, msg = await self._esp.airecv()
-                if host and msg:
-                    await self._irq(host, msg)
-            except Exception as e:
-                logger().error(f"mesh rx error: {e}")
-                await asyncio.sleep_ms(20)
+            await _sleep_ms(5)
 
+    async def lifecycle_task(self) -> None:
+        """
+        This mesh task needs to be run when receive_task is run.
+        It enables auto neighbor discovery and neighbor table cleanup.
+
+        Returns:
+
+        """
+        if not self._started:
+            self.start()
+
+        # pre-allocate to save lookup time
+        _ticks_diff = time.ticks_diff
+        _ticks_ms = time.ticks_ms
+        _sleep_ms = asyncio.sleep_ms
+        _async_hello = self.async_hello
+        _clean_neighbors = self._cleanup_neighbors
+        _clean_fragments = self._clean_fragment_buffers
+
+        now = _ticks_ms()
+
+        last_hello = now - (
+            self.node_id() % 2000
+        )  # not just time but with jitter -> not all at the same time -> collision
+        last_clean = now
+
+        while True:
+            now = _ticks_ms()
+
+            # Hello
+            if _ticks_diff(now, last_hello) > MESH_HELLO_INTERVAL:
+                await _async_hello()
+                last_hello = now
+
+            # Clean
+            if _ticks_diff(now, last_clean) > MESH_CLEAN_INTERVAL:
+                _clean_neighbors()
+                _clean_fragments(now)
+                last_clean = now
+
+            # yield
+            await _sleep_ms(5)
+
+    @deprecated(
+        "Function was split in two separate ones, to fix the mesh-rx blocking other background tasks.See lifecycle_task and receive_task."
+    )
     async def run(self):
         """
         Unified mesh loop:

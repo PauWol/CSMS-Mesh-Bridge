@@ -1,10 +1,11 @@
 import uasyncio as asyncio
-from core import ONBOARD_LED
+from core import get_onboard_led
 from machine import UART, Pin
 import ujson
 import utime
 
 from core.logging import logger
+from core.io import NeoLed
 
 from comms_commands import ping
 
@@ -13,8 +14,7 @@ COMMAND_PREFIX     = "cmd:"
 COMMAND_DELIMITER  = ";"
 COMMAND_TERMINATOR = ":end"
 
-CMD_UART_ACK = "UAK"
-
+CMD_UART_ACK     = "UAK"
 CMD_PING         = "PNG"
 CMD_STATUS       = "STS"
 CMD_SENSORS      = "SNS"
@@ -27,36 +27,12 @@ UART_TX   = 17       # GP17 → peer RX
 UART_RX   = 16       # GP16 ← peer TX
 BAUD_RATE = 115200
 
-STATUS_LED_PIN = ONBOARD_LED
+# The Pi's DEFAULT_TIMEOUT for _request is 5.0 s.
+# We must respond within that window, so the mesh ping gets a shorter budget
+# to ensure the UART response always arrives before the Pi gives up.
+_MESH_PING_TIMEOUT = 3.5  # seconds – leaves 1.5 s margin on a 5 s Pi timeout
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MOCK STATE  —  replace these with your real data sources
-# ══════════════════════════════════════════════════════════════════════════════
-
-def get_status() -> dict:
-    """
-    TODO: replace with real MCU state.
-    Should return current wake/sleep schedule and threat assessment.
-    """
-    return {
-        "nextWake":      utime.time() + 300,   # TODO: read from scheduler
-        "sleepInterval": 300,                   # TODO: read from config
-        "lastSync":      utime.time() - 60,    # TODO: read from sync manager
-        "threatScore":   0,                     # TODO: read from threat engine
-    }
-
-
-def get_sensors() -> dict:
-    """
-    TODO: replace with real sensor read logic.
-    Should return the latest sensor sample.
-    """
-    return {
-        "name":      "mock_sensor",             # TODO: real sensor name
-        "value":     "0.00",                    # TODO: real sensor value (as str)
-        "timestamp": utime.time(),
-    }
+STATUS_LED_PIN = get_onboard_led()
 
 
 def get_log_info() -> dict:
@@ -64,19 +40,18 @@ def get_log_info() -> dict:
     TODO: replace with real log metadata read.
     """
     return {
-        "id":       1,                          # TODO: read from log store
-        "source":   "espnow-mcu",              # TODO: real source label
-        "coverage": "0-0",                      # TODO: real entry range e.g. "0-142"
+        "id":       1,
+        "source":   "espnow-mcu",
+        "coverage": "0-0",          # TODO: real entry range e.g. "0-142"
     }
 
 
 def get_log_entries(log_id: int) -> list:
     """
     TODO: replace with actual log retrieval by id.
-    Should return a list of dicts, each matching LogInfoResponse shape.
     """
     return [
-        {"id": log_id, "source": "espnow-mcu", "coverage": "0-10"},   # TODO: real entries
+        {"id": log_id, "source": "espnow-mcu", "coverage": "0-10"},
         {"id": log_id, "source": "espnow-mcu", "coverage": "10-20"},
     ]
 
@@ -92,12 +67,7 @@ class ESPUartResponder:
 
     def __init__(self):
         import gc
-
         gc.collect()
-        print("FREE before UART:", gc.mem_free())
-
-        tx_pin = Pin(UART_TX)
-        rx_pin = Pin(UART_RX)
 
         self._uart = UART(
             UART_ID,
@@ -106,11 +76,14 @@ class ESPUartResponder:
             parity=None,
             stop=1,
             timeout=100,
-            tx=tx_pin,
-            rx=rx_pin,
+            tx=Pin(UART_TX),
+            rx=Pin(UART_RX),
             rxbuf=512,
         )
-        self.led = Pin(STATUS_LED_PIN, Pin.OUT)
+
+        self.led = NeoLed(STATUS_LED_PIN[1])
+
+    # ── Wire encoding ─────────────────────────────────────────────────────────
 
     @staticmethod
     def _encode(command: str, parameters: dict) -> bytes:
@@ -124,26 +97,33 @@ class ESPUartResponder:
         ).encode()
 
     @staticmethod
-    def _decode(raw: str) -> tuple[str, dict]:
+    def _decode(raw: str) -> tuple:
         """
         Parse a raw frame into (command_token, parameters_dict).
         Raises ValueError for malformed frames.
         """
         raw = raw.strip()
         if not raw.startswith(COMMAND_PREFIX) or not raw.endswith(COMMAND_TERMINATOR):
-            raise ValueError(f"Bad frame: {raw!r}")
+            raise ValueError("Bad frame: {!r}".format(raw))
 
         body  = raw[len(COMMAND_PREFIX):-len(COMMAND_TERMINATOR)]
-        parts = body.split(COMMAND_DELIMITER, 1)   # max 1 split → safe for JSON values
+        # Split on first delimiter only – JSON values may contain COMMAND_DELIMITER
+        parts = body.split(COMMAND_DELIMITER, 1)
 
         command = parts[0]
         params  = ujson.loads(parts[1]) if len(parts) == 2 and parts[1] else {}
         return command, params
 
+    # ── Low-level I/O ─────────────────────────────────────────────────────────
+
     def _write(self, command: str, parameters: dict):
         self._uart.write(self._encode(command, parameters))
 
-    async def _read_line(self) -> str | None:
+    def send_data(self, data: bytearray):
+        """Forward a raw binary sensor frame to the Pi."""
+        self._uart.write(data)
+
+    async def _read_line(self):
         """Return the next complete line or None if nothing is available yet."""
         if self._uart.any():
             raw = self._uart.readline()
@@ -158,24 +138,23 @@ class ESPUartResponder:
         await asyncio.sleep_ms(30)
         self.led.off()
 
+    # ── Command handlers ──────────────────────────────────────────────────────
+
     async def _handle_uart_ack(self, _params: dict):
+        """Immediate physical-layer ACK – no external calls, always fast."""
         self._write(CMD_UART_ACK, {"status": "ok"})
         await asyncio.sleep_ms(0)
 
     async def _handle_ping(self, _params: dict):
+        """
+        Forward a liveness probe to the security node via mesh and relay the
+        result.  Uses _MESH_PING_TIMEOUT (< Pi's UART timeout) so we always
+        write the response before the Pi gives up waiting.
+        """
         st = "ok"
-
-        if not await ping():
+        if not await ping(timeout=_MESH_PING_TIMEOUT):
             st = "unconnected"
         self._write(CMD_PING, {"status": st})
-
-    async def _handle_status(self, _params: dict):
-        self._write(CMD_STATUS, get_status())
-        await asyncio.sleep_ms(0)
-
-    async def _handle_sensors(self, _params: dict):
-        self._write(CMD_SENSORS, get_sensors())
-        await asyncio.sleep_ms(0)
 
     async def _handle_log_info(self, _params: dict):
         self._write(CMD_LOG_INFO, get_log_info())
@@ -191,22 +170,22 @@ class ESPUartResponder:
         await asyncio.sleep_ms(0)
 
     _HANDLERS = {
-        CMD_PING: _handle_ping,
-        CMD_STATUS: _handle_status,
-        CMD_SENSORS: _handle_sensors,
-        CMD_LOG_INFO: _handle_log_info,
+        CMD_PING:         _handle_ping,
+        CMD_LOG_INFO:     _handle_log_info,
         CMD_LOG_DOWNLOAD: _handle_log_download,
-        CMD_UART_ACK: _handle_uart_ack,
+        CMD_UART_ACK:     _handle_uart_ack,
     }
 
     async def _dispatch(self, command: str, params: dict):
         handler = self._HANDLERS.get(command)
         if handler:
-            await handler(self,params)
+            await handler(self, params)
         else:
-            logger().warn(f"UART Unknown command: {command!r}")
+            logger().warn("UART Unknown command: {!r}".format(command))
             self._write(command, {"error": "unknown_command"})
             await asyncio.sleep_ms(0)
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
 
     async def run(self):
         logger().debug("UART Responder started – listening on GP16/GP17")
@@ -221,13 +200,21 @@ class ESPUartResponder:
 
             try:
                 command, params = self._decode(line)
-                logger().debug(f"UART ← {command} params={params}")
+                logger().debug("UART <- {} params={}".format(command, params))
                 await self._dispatch(command, params)
 
             except ValueError as e:
-                logger().error(f"UART Frame error: {e}")
+                logger().error("UART Frame error: {}".format(e))
 
-async def main():
-    responder = ESPUartResponder()
 
-    await responder.run()
+# ── Singleton ─────────────────────────────────────────────────────────────────
+
+_resp = None
+
+
+def get_uart():
+    global _resp
+    if _resp:
+        return _resp
+    _resp = ESPUartResponder()
+    return _resp

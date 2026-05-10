@@ -1,93 +1,163 @@
 import struct
-from micropython import const
 
-from core.comms.mesh import mesh
+from lib.uart import get_uart
 
-def pack(entries: list[tuple[str, int, str]]) -> bytearray:
-    """Encode list of (sensor, timestamp, value) → bytearray."""
-    buf = bytearray()
-    buf.append(len(entries))  # entry count (1 B)
+# ── Protocol flags (must match sender) ───────────────────────────────────────
+FLAG_PIR    = 0x01
+FLAG_PHC    = 0x02
+FLAG_RADAR  = 0x04
+FLAG_THREAT = 0x08
+FLAG_SLEEP  = 0x10
+FLAG_VOLT   = 0x20
+FLAG_TTE    = 0x40
 
-    for sensor, ts, value in entries:
-        s = sensor.encode()
-        v = value.encode()
-        buf.append(len(s))  # sensor str length (1 B)
-        buf.extend(s)  # sensor bytes
-        buf.extend(struct.pack(">I", ts))  # timestamp uint32 (4 B)
-        buf.append(len(v))  # value str length (1 B)
-        buf.extend(v)  # value bytes
-
-    return buf
+PKT_VERSION = 1
+# constants at top (same as sender)
+_PHASE_DEC = {0: "DAY", 1: "DUSK", 2: "NIGHT"}
 
 
-def unpack(buf: bytearray) -> list[tuple[str, int, str]]:
-    """Decode bytearray → list of (sensor, timestamp, value)."""
-    offset = 0
-    n = buf[offset]
-    offset += 1
-    entries = []
 
-    for _ in range(n):
-        s_len = buf[offset]
-        offset += 1
-        sensor = buf[offset : offset + s_len].decode()
-        offset += s_len
-        ts = struct.unpack_from(">I", buf, offset)[0]
+def unpack(buf):
+    """Gateway-side unpack. Returns a dict of present fields."""
+    version, flags, base_ts = struct.unpack_from(">BBL", buf, 0)
+    offset = 6
+    out = {"version": version, "flags": flags, "base_ts": base_ts}
+
+    if flags & FLAG_PIR:
+        val, delta = struct.unpack_from(">BH", buf, offset)
+        out["pir"] = {"value": bool(val), "ts": base_ts + delta}
+        offset += 3
+
+    if flags & FLAG_PHC:
+        raw, delta = struct.unpack_from(">HH", buf, offset)
+        out["phc"] = {"value": raw / 65535, "ts": base_ts + delta}
         offset += 4
-        v_len = buf[offset]
-        offset += 1
-        value = buf[offset : offset + v_len].decode()
-        offset += v_len
-        entries.append((sensor, ts, value))
 
-    return entries
+    if flags & FLAG_RADAR:
+        dist, energy, delta = struct.unpack_from(">HHH", buf, offset)
+        out["radar"] = {"distance": dist, "energy": energy, "ts": base_ts + delta}
+        offset += 6
+
+    if flags & FLAG_THREAT:
+        score, threshold, phase = struct.unpack_from(">ffB", buf, offset)
+        out["threat"] = {
+            "score": score,
+            "threshold": threshold,
+            "phase": _PHASE_DEC.get(phase, "UNKNOWN"),
+        }
+        offset += 9
+
+    if flags & FLAG_SLEEP:
+        (ms,) = struct.unpack_from(">L", buf, offset)
+        out["sleep_ms"] = ms
+        offset += 4
+
+    if flags & FLAG_VOLT:
+        raw, delta = struct.unpack_from(">HH", buf, offset)
+        out["volt"] = {"value": raw / 1000, "ts": base_ts + delta}
+        offset += 4
+
+    if flags & FLAG_TTE:
+        (s,) = struct.unpack_from(">L", buf, offset)
+        out["tte_s"] = s
+
+    return out
 
 
-PIR_IDX = const(0)
-PIR_INDICATOR = const("P")
 
-PHC_IDX = const(1)
-PHC_INDICATOR = const("C")
 
-RADAR_IDX = const(2)
-RADAR_INDICATOR = const("R")
+# ── SensorData ────────────────────────────────────────────────────────────────
 
 
 class SensorData:
+    """
+    Holds the most-recently received reading for each sensor channel.
+    All fields are None until the first packet containing that channel arrives.
+    """
+
+    __slots__ = ("_pir", "_phc", "_radar", "_threat", "_sleep_ms", "_volt", "_tte_s")
+
     def __init__(self):
-        self._data = [] * 3
+        self._pir      = None  # {"value": bool,  "ts": int}
+        self._phc      = None  # {"value": float, "ts": int}
+        self._radar    = None  # {"distance": int, "energy": int, "ts": int}
+        self._threat   = None  # float
+        self._sleep_ms = None  # int
+        self._volt     = None  # {"value": float, "ts": int}
+        self._tte_s    = None  # int
 
-    def pir(self) -> tuple[str,int,str]:
-        return self._data[PIR_IDX]
+    # ── accessors ─────────────────────────────────────────────────────────────
 
-    def photo_cell(self) -> tuple[str,int,str]:
-        return self._data[PHC_IDX]
+    def pir(self):
+        return self._pir
 
-    def radar(self) -> tuple[str,int,str]:
-        return self._data[RADAR_IDX]
+    def photo_cell(self):
+        return self._phc
 
-    def receive(self,payload:bytearray):
-        _p = unpack(payload)
+    def radar(self):
+        return self._radar
 
-        for i in _p:
+    def threat(self):
+        return self._threat
 
-            if i[0] == PIR_INDICATOR:
-                self._data[PIR_IDX] = i
-                continue
+    def sleep_ms(self):
+        return self._sleep_ms
 
-            if i[0] == PHC_INDICATOR:
-                self._data[PHC_IDX] = i
-                continue
+    def volt(self):
+        return self._volt
 
-            if i[0] == RADAR_INDICATOR:
-                self._data[RADAR_IDX] = i
+    def tte_s(self):
+        return self._tte_s
+
+    def receive(self,payload: bytearray):
+
+        get_uart().send_data(payload)
+
+        parsed = unpack(payload)
+        print("RX flags=0x%02x base_ts=%d" % (parsed["flags"], parsed["base_ts"]))
+
+        if "pir" in parsed:
+            self._pir = parsed["pir"]  # noqa: E701
+        if "phc" in parsed:
+            self._phc = parsed["phc"]
+        if "radar" in parsed:
+            self._radar = parsed["radar"]
+        if "threat" in parsed:
+            self._threat = parsed["threat"]
+        if "sleep_ms" in parsed:
+            self._sleep_ms = parsed["sleep_ms"]
+        if "volt" in parsed:
+            self._volt = parsed["volt"]
+        if "tte_s" in parsed:
+            self._tte_s = parsed["tte_s"]
+
+        print(self._summary())
+
+    # ── ingress ───────────────────────────────────────────────────────────────
+
+    def _summary(self) -> str:
+        parts = []
+        if self._pir      is not None: parts.append("pir=%s"      % self._pir["value"])
+        if self._phc      is not None: parts.append("phc=%.3f"    % self._phc["value"])
+        if self._radar    is not None: parts.append("radar=%dcm"  % self._radar["distance"])
+        if self._threat is not None:
+            parts.append(
+                "threat=%.2f/ %s / %s" % (self._threat["score"], self._threat["phase"],self._threat["threshold"])
+            )
+        if self._sleep_ms is not None: parts.append("sleep=%dms"  % self._sleep_ms)
+        if self._volt     is not None: parts.append("volt=%.3fV"  % self._volt["value"])
+        if self._tte_s    is not None: parts.append("tte=%ds"     % self._tte_s)
+        return " ".join(parts) if parts else "(empty)"
 
 
+# ── singleton ─────────────────────────────────────────────────────────────────
+
+_sensor_data: SensorData | None = None
 
 
-_sensor_data = SensorData()
-
-
-def data():
+def data() -> SensorData:
     global _sensor_data
+    if _sensor_data:
+        return _sensor_data
+    _sensor_data = SensorData()
     return _sensor_data
