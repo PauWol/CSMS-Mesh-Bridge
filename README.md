@@ -13,8 +13,6 @@ The Mesh Bridge operates as a dual-interface hub:
 - **Async I/O**: Built entirely with `uasyncio` for responsive, non-blocking communication
 - **Mesh Networking**: Multi-hop ESPNow mesh with automatic neighbor discovery and packet routing
 - **UART Protocol**: Structured command/response protocol for gateway integration
-- **Logging**: Configurable CSV logging with file rotation and console output
-- **Configuration**: TOML-based settings for logger, mesh, and comms parameters
 
 ## Technical Stack
 
@@ -22,21 +20,6 @@ The Mesh Bridge operates as a dual-interface hub:
 - **IDE**: PyCharm with MicroPython plugin for development and debugging
 - **Communication**: ESPNow mesh + UART serial
 - **Architecture**: Modular, async-first design separated by concerns (logging, comms, I/O)
-
-## Project Structure
-
-```
-core/
-  ├── comms/          # Mesh & communication protocols
-  │   ├── mesh/       # ESPNow mesh implementation with routing
-  │   └── crc8.py     # Packet integrity checking
-  ├── io/             # Hardware interfaces (UART, LED, ADC)
-  ├── logging/        # Structured logging with CSV export
-  ├── config.py       # Configuration loader
-  └── queue.py        # Ring buffer for async message queuing
-lib/
-  └── uart.py         # UART responder for gateway communication
-```
 
 ## Quick Start
 
@@ -54,7 +37,8 @@ Edit `config.toml` to customize:
 ## Protocol
 
 ### UART Commands (gateway → bridge)
-- `CMD_PING` – Health check
+- `CMD_UART_ACK` - Uart connection check ("ping for gateway")
+- `CMD_PING` – Health check ("ping for security-node")
 - `CMD_STATUS` – Device status
 - `CMD_SENSORS` – Sensor readings
 - `CMD_LOG_*` – Logging operations
